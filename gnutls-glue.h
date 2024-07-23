@@ -3,7 +3,6 @@
 #ifndef GNUTLS_GLUE_H_
 #define GNUTLS_GLUE_H_
 
-#include <gnutls/gnutls.h>
 #include <ngtcp2/ngtcp2.h>
 
 int setup_gnutls_for_quic (gnutls_session_t session, ngtcp2_conn *conn);

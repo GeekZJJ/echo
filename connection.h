@@ -4,13 +4,12 @@
 #define CONNECTION_H_
 
 #include "stream.h"
-#include <gnutls/gnutls.h>
 #include <ngtcp2/ngtcp2.h>
 #include <stdbool.h>
 
 typedef struct _Connection Connection;
 
-Connection *connection_new (gnutls_session_t session, int socket_fd);
+Connection *connection_new (void* session, int socket_fd);
 void connection_free (Connection *connection);
 
 ngtcp2_conn *connection_get_ngtcp2_conn (Connection *connection);
