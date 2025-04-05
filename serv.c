@@ -12,17 +12,16 @@
 #include <ngtcp2/ngtcp2.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <uv.h>
 
 #define BUF_SIZE 12800
 
 typedef struct _Server
 {
-  int epoll_fd;
-  int socket_fd;
+  uv_loop_t* loop;
+  uv_udp_t udp_recv_socket;
   struct sockaddr_storage local_addr;
   size_t local_addrlen;
   /* list of Connection; TODO: use a hash table */
@@ -34,10 +33,7 @@ typedef struct _Server
 static inline void
 server_deinit (Server *server)
 {
-  if (server->epoll_fd >= 0)
-    close (server->epoll_fd);
-  if (server->socket_fd >= 0)
-    close (server->socket_fd);
+  uv_udp_recv_stop(&server->udp_recv_socket);
   g_list_free_full (server->connections, (GDestroyNotify)connection_free);
 }
 
@@ -61,7 +57,7 @@ rand_cb (uint8_t *dest, size_t destlen,
 {
     size_t i;
     for (i = 0; i < destlen; ++i) {
-        *dest = (uint8_t) random();
+        *dest = (uint8_t) rand();
     }
 }
 
@@ -176,7 +172,7 @@ find_connection (Server *server, const uint8_t *dcid, size_t dcid_size)
 
 static Connection *
 accept_connection (Server *server,
-                   struct sockaddr *remote_addr, size_t remote_addrlen,
+                   const struct sockaddr *remote_addr, size_t remote_addrlen,
                    const uint8_t *data, size_t data_size)
 {
   ngtcp2_pkt_hd header;
@@ -186,11 +182,9 @@ accept_connection (Server *server,
   if (ret < 0)
     return NULL;
 
-
-
   __attribute__((cleanup(connection_freep))) Connection *connection = NULL;
 
-  connection = connection_new (NULL, server->socket_fd);
+  connection = connection_new (server->loop, NULL, &server->udp_recv_socket);
   if (!connection)
     return NULL;
 
@@ -254,179 +248,70 @@ accept_connection (Server *server,
   return c;
 }
 
-static int
-handle_incoming (Server *server)
-{
-  uint8_t buf[BUF_SIZE];
+void udp_recv_cb(uv_udp_t *req,
+                 ssize_t nread,
+                 const uv_buf_t *buf,
+                 const struct sockaddr *addr,
+                 unsigned flags) {
+  if (nread < 0) {
+    fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
+    uv_close((uv_handle_t *)req, NULL);
+    free(buf->base);
+    return;
+  }
+  if (nread > 0) {
+    Server *server = req->data;
 
-  for (;;)
-    {
-      ssize_t n_read;
-      struct sockaddr_storage remote_addr;
-      size_t remote_addrlen = sizeof(remote_addr);
-      int ret;
+    int ret;
+    size_t remote_addrlen = (addr->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+  
+    ngtcp2_version_cid vc;
+    g_message("recv %lu", nread);
+  
+    ret = ngtcp2_pkt_decode_version_cid(&vc, (const uint8_t *)buf->base, nread,
+                                        NGTCP2_MAX_CIDLEN);
+    if (ret < 0) {
+      g_message("ngtcp2_pkt_decode_version_cid: %s", ngtcp2_strerror(ret));
+      goto out;
+    }
 
-      n_read = recv_packet (server->socket_fd, buf, sizeof(buf),
-                           (struct sockaddr *)&remote_addr,
-                           &remote_addrlen);
-      if (n_read < 0)
-        {
-          if (n_read != EAGAIN && n_read != EWOULDBLOCK)
-            return 0;
-          g_message ("recv_packet: %s\n", g_strerror (errno));
-          return -1;
-        }
-
-      ngtcp2_version_cid vc;
-
-      ret = ngtcp2_pkt_decode_version_cid (&vc,
-                                           buf, n_read,
-                                           NGTCP2_MAX_CIDLEN);
-      if (ret < 0)
-        {
-          g_message ("ngtcp2_pkt_decode_version_cid: %s",
-                     ngtcp2_strerror (ret));
-          return -1;
-        }
-
-      /* Find any existing connection by DCID */
-      Connection *connection = find_connection (server, vc.dcid, vc.dcidlen);
+    /* Find any existing connection by DCID */
+    Connection *connection = find_connection(server, vc.dcid, vc.dcidlen);
+    if (!connection) {
+      connection = accept_connection(server, addr,
+                            remote_addrlen, (const uint8_t *)buf->base, nread);
       if (!connection)
-        {
-          connection = accept_connection (server,
-                                          (struct sockaddr *)&remote_addr,
-                                          remote_addrlen,
-                                          buf, n_read);
-          if (!connection)
-            return -1;
+        goto out;
 
-          ret = connection_start (connection);
-          if (ret < 0)
-            return -1;
-
-          struct epoll_event ev;
-          ev.events = EPOLLIN | EPOLLET;
-          ev.data.fd = connection_get_timer_fd (connection);
-          ret = epoll_ctl (server->epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev);
-          if (ret < 0)
-            {
-              g_message ("epoll_ctl: %s", g_strerror (ret));
-              return -1;
-            }
-        }
-
-      ngtcp2_conn *conn = connection_get_ngtcp2_conn (connection);
-
-      ngtcp2_path path;
-      memcpy (&path, ngtcp2_conn_get_path (conn), sizeof(path));
-      path.remote.addrlen = remote_addrlen;
-      path.remote.addr = (struct sockaddr *)&remote_addr;
-
-      ngtcp2_pkt_info pi;
-      memset (&pi, 0, sizeof(pi));
-
-      ret = ngtcp2_conn_read_pkt (conn, &path, &pi, buf, n_read, timestamp ());
+      ret = connection_start(connection);
       if (ret < 0)
-        {
-          g_message ("ngtcp2_conn_read_pkt: %s",
-                     ngtcp2_strerror (ret));
-
-          /* Remove the connection upon read error */
-          GList *link =
-            g_list_find (server->connections, connection);
-          server->connections =
-            g_list_delete_link (server->connections, link);
-          ret = epoll_ctl (server->epoll_fd, EPOLL_CTL_DEL,
-                           connection_get_timer_fd (connection),
-                           NULL);
-          if (ret < 0)
-            {
-              g_message ("epoll_ctl: %s",
-                         g_strerror (errno));
-              return -1;
-            }
-          connection_set_socket_fd (connection, -1);
-          connection_free (connection);
-        }
-    }
-  return 0;
-}
-
-#define MAX_EVENTS 64
-
-static int
-run (Server *server)
-{
-  __attribute__((cleanup(stream_freep))) Stream *stream = NULL;
-
-  server->epoll_fd = epoll_create1 (0);
-  if (server->epoll_fd < 0)
-    {
-      g_message ("epoll_create1: %s", g_strerror (errno));
-      return -1;
+        goto out;
     }
 
-  struct epoll_event ev;
+    ngtcp2_conn *conn = connection_get_ngtcp2_conn(connection);
 
-  ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-  ev.data.fd = server->socket_fd;
-  if (epoll_ctl (server->epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev) < 0)
-    {
-      g_debug ("epoll_ctl: %s", g_strerror (errno));
-      return -1;
+    ngtcp2_path path;
+    memcpy(&path, ngtcp2_conn_get_path(conn), sizeof(path));
+    path.remote.addrlen = remote_addrlen;
+    path.remote.addr = (struct sockaddr *)addr;
+
+    ngtcp2_pkt_info pi;
+    memset(&pi, 0, sizeof(pi));
+
+    ret = ngtcp2_conn_read_pkt(conn, &path, &pi, (const uint8_t *)buf->base,
+                               nread, timestamp());
+    if (ret < 0) {
+      g_message("ngtcp2_conn_read_pkt: %s", ngtcp2_strerror(ret));
+  
+      /* Remove the connection upon read error */
+      GList *link = g_list_find(server->connections, connection);
+      server->connections = g_list_delete_link(server->connections, link);
+      connection_free (connection);
     }
-
-  for (;;)
-    {
-      struct epoll_event events[MAX_EVENTS];
-      int nfds;
-
-      nfds = epoll_wait (server->epoll_fd, events, MAX_EVENTS, -1);
-      if (nfds < 0)
-        {
-          g_debug ("epoll_wait: %s", g_strerror (errno));
-          return -1;
-        }
-
-      for (int n = 0; n < nfds; n++)
-        {
-	  int ret;
-
-          if (events[n].data.fd == server->socket_fd)
-            {
-              if (events[n].events & EPOLLIN)
-		(void)handle_incoming (server);
-
-              if (events[n].events & EPOLLOUT)
-		for (GList *l = server->connections; l; l = l->next)
-		  {
-		    Connection *connection = l->data;
-		    (void)connection_write (connection);
-		  }
-            }
-	  else
-	    for (GList *l = server->connections; l; l = l->next)
-	      {
-		Connection *connection = l->data;
-		if (events[n].data.fd == connection_get_timer_fd (connection))
-		  {
-		    ngtcp2_conn *conn =
-		      connection_get_ngtcp2_conn (connection);
-		    ret = ngtcp2_conn_handle_expiry (conn, timestamp ());
-		    if (ret < 0)
-		      {
-			g_debug ("ngtcp2_conn_handle_expiry: %s",
-				 ngtcp2_strerror (ret));
-			continue;
-		      }
-
-		    (void)connection_write (connection);
-		  }
-	      }
-        }
-    }
-
-  return 0;
+    connection_start(connection);
+  }
+out:
+  free(buf->base);
 }
 
 static GOptionEntry entries[] =
@@ -441,7 +326,7 @@ main (int argc, char **argv)
     {
       .connections = NULL,
       .local_addrlen = sizeof(struct sockaddr_storage),
-      .epoll_fd = -1,
+      .loop = uv_default_loop(),
     };
 
   g_set_prgname ("serv");
@@ -465,15 +350,15 @@ main (int argc, char **argv)
       return EXIT_FAILURE;
     }
 
-  /* Create a server socket */
-  __attribute__((cleanup(closep))) int fd = -1;
+  if (!resolve_and_bind (server.loop, argv[1], argv[2],
+    &server.udp_recv_socket, udp_recv_cb,
+    (struct sockaddr *)&server.local_addr,
+    &server.local_addrlen)){
+    g_error ("resolve_and_bind");
+    return errno;
+  }
 
-  fd = resolve_and_bind (argv[1], argv[2],
-                         (struct sockaddr *)&server.local_addr,
-                         &server.local_addrlen);
-  if (fd < 0)
-    error (EXIT_FAILURE, errno, "resolve_and_bind");
-  server.socket_fd = steal_fd (&fd);
+  server.udp_recv_socket.data = &server;
 
   ngtcp2_settings_default (&server.settings);
   server.settings.initial_ts = timestamp ();
@@ -483,5 +368,6 @@ main (int argc, char **argv)
   server.settings.pmtud_probeslen = 3;
   server.settings.max_tx_udp_payload_size = 1500;
 
-  return run (&server) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+  uv_run(server.loop, UV_RUN_DEFAULT);
+  return uv_loop_close(server.loop);
 }

@@ -5,114 +5,105 @@
 #include "utils.h"
 
 #include <errno.h>
-#include <netdb.h>
 #include <glib.h>
 #include <ngtcp2/ngtcp2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <uv.h>
 
-int
-resolve_and_connect (const char *host, const char *port,
+void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+    buf->base = malloc(suggested_size);
+    buf->len = suggested_size;
+}
+
+bool
+resolve_and_connect (uv_loop_t *loop, const char *host, const char *port,
+                     uv_udp_t *udp_recv_socket, uv_udp_recv_cb udp_recv_cb,
                      struct sockaddr *local_addr, size_t *local_addrlen,
                      struct sockaddr *remote_addr, size_t *remote_addrlen)
 {
-  struct addrinfo hints;
-  struct addrinfo *result, *rp;
-  int ret, fd;
+  uv_getaddrinfo_t resolver;
+  int r = uv_getaddrinfo(loop, &resolver, NULL, host, port, NULL);
+  if (r) {
+      fprintf(stderr, "getaddrinfo call error: %s\n", uv_strerror(r));
+      return false;
+  }
 
-  memset (&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_DGRAM;
-
-  ret = getaddrinfo (host, port, &hints, &result);
-  if (ret != 0)
-    return -1;
-
-  for (rp = result; rp != NULL; rp = rp->ai_next)
-    {
-      fd = socket (rp->ai_family, rp->ai_socktype | SOCK_NONBLOCK,
-                   rp->ai_protocol);
-      if (fd == -1)
-        continue;
-
-      if (connect (fd, rp->ai_addr, rp->ai_addrlen) == 0)
-        {
-          *remote_addrlen = rp->ai_addrlen;
-          memcpy(remote_addr, rp->ai_addr, rp->ai_addrlen);
-
-          socklen_t len = (socklen_t)*local_addrlen;
-          if (getsockname (fd, local_addr, &len) == -1)
-            return -1;
-          *local_addrlen = len;
-          break;
-        }
-
-      close (fd);
+  struct addrinfo* ai;
+  for (ai = resolver.addrinfo; ai != NULL; ai = ai->ai_next) {
+    if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6)
+      continue;
+    uv_udp_init(loop, udp_recv_socket);
+    struct sockaddr_storage local;
+    memset(&local, 0, sizeof(local));
+    if (ai->ai_family == AF_INET) {
+      struct sockaddr_in *l = (struct sockaddr_in *)&local;
+      l->sin_family = AF_INET;
+      l->sin_addr.s_addr = INADDR_ANY;
+      l->sin_port = htons(0);
+    } else {
+      struct sockaddr_in6 *l = (struct sockaddr_in6 *)&local;
+      l->sin6_family = AF_INET6;
+      l->sin6_addr = in6addr_any;
+      l->sin6_port = htons(0);
     }
+    if (0==uv_udp_bind(udp_recv_socket, (const struct sockaddr *) &local, 0)) {
+      *remote_addrlen = ai->ai_addrlen;
+      memcpy(remote_addr, ai->ai_addr, ai->ai_addrlen);
+      int len = ai->ai_addrlen;
+      if (uv_udp_getsockname (udp_recv_socket, local_addr, &len) != 0)
+        return false;
+      *local_addrlen = len;
+      uv_udp_recv_start(udp_recv_socket, alloc_buffer, udp_recv_cb);
+      break;
+    }
+  }
 
-  freeaddrinfo (result);
+  uv_freeaddrinfo(resolver.addrinfo);
+  if (ai == NULL)
+    return false;
 
-  if (rp == NULL)
-    return -1;
-
-  return fd;
+  return true;
 }
 
-int
-resolve_and_bind (const char *host, const char *port,
+bool
+resolve_and_bind (uv_loop_t *loop, const char *host, const char *port,
+                  uv_udp_t *udp_recv_socket, uv_udp_recv_cb udp_recv_cb,
                   struct sockaddr *local_addr, size_t *local_addrlen)
 {
-  struct addrinfo hints;
-  struct addrinfo *result, *rp;
-  int ret, fd;
+  uv_getaddrinfo_t resolver;
+  int r = uv_getaddrinfo(loop, &resolver, NULL, host, port, NULL);
+  if (r) {
+      fprintf(stderr, "getaddrinfo call error: %s\n", uv_strerror(r));
+      return false;
+  }
 
-  memset (&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_DGRAM;
-  hints.ai_flags  =  AI_PASSIVE;
-
-  ret = getaddrinfo (host, port, &hints, &result);
-  if (ret != 0)
-    return -1;
-
-  for (rp = result; rp != NULL; rp = rp->ai_next)
-    {
-      fd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-      if (fd == -1)
-        continue;
-
-      if (bind (fd, rp->ai_addr, rp->ai_addrlen) == 0)
-        {
-          *local_addrlen = rp->ai_addrlen;
-          memcpy(local_addr, rp->ai_addr, rp->ai_addrlen);
-          break;
-        }
-
-      close (fd);
+  struct addrinfo* ai;
+  for (ai = resolver.addrinfo; ai != NULL; ai = ai->ai_next) {
+    uv_udp_init(loop, udp_recv_socket);
+    if (0==uv_udp_bind(udp_recv_socket, (const struct sockaddr *) ai->ai_addr, UV_UDP_REUSEADDR)) {
+      uv_udp_recv_start(udp_recv_socket, alloc_buffer, udp_recv_cb);
+      *local_addrlen = ai->ai_addrlen;
+      memcpy(local_addr, ai->ai_addr, ai->ai_addrlen);
+      break;
     }
+  }
 
-  freeaddrinfo(result);
+  uv_freeaddrinfo(resolver.addrinfo);
+  if (ai == NULL)
+    return false;
 
-  if (rp == NULL)
-    return -1;
-
-  return fd;
+  return true;
 }
 
 uint64_t
 timestamp (void)
 {
-  struct timespec tp;
-
-  if (clock_gettime (CLOCK_MONOTONIC, &tp) < 0)
-    return 0;
-
-  return (uint64_t)tp.tv_sec * NGTCP2_SECONDS + (uint64_t)tp.tv_nsec;
+  return uv_hrtime();
 }
 
 void
@@ -124,57 +115,6 @@ log_printf (void *user_data, const char *fmt, ...)
   va_start (ap, fmt);
   g_logv ("ngtcp2", G_LOG_LEVEL_DEBUG, fmt, ap);
   va_end (ap);
-}
-
-ssize_t
-recv_packet (int fd, uint8_t *data, size_t data_size,
-             struct sockaddr *remote_addr, size_t *remote_addrlen)
-{
-  struct iovec iov;
-  iov.iov_base = data;
-  iov.iov_len = data_size;
-
-  struct msghdr msg;
-  memset (&msg, 0, sizeof(msg));
-
-  msg.msg_name = remote_addr;
-  msg.msg_namelen = *remote_addrlen;
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-
-  ssize_t ret;
-
-  do
-    ret = recvmsg (fd, &msg, MSG_DONTWAIT);
-  while (ret < 0 && errno == EINTR);
-
-  *remote_addrlen = msg.msg_namelen;
-
-  return ret;
-}
-
-ssize_t
-send_packet (int fd, const uint8_t *data, size_t data_size,
-             struct sockaddr *remote_addr, size_t remote_addrlen)
-{
-  struct iovec iov;
-  iov.iov_base = (void *)data;
-  iov.iov_len = data_size;
-
-  struct msghdr msg;
-  memset (&msg, 0, sizeof(msg));
-  msg.msg_name = remote_addr;
-  msg.msg_namelen = remote_addrlen;
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-
-  ssize_t ret;
-
-  do
-    ret = sendmsg (fd, &msg, MSG_DONTWAIT);
-  while (ret < 0 && errno == EINTR);
-
-  return ret;
 }
 
 int rand_bytes(uint8_t *data, size_t len);

@@ -4,7 +4,6 @@
 
 #include "connection.h"
 
-#include <sys/timerfd.h>
 #include <unistd.h>
 #include "utils.h"
 
@@ -13,8 +12,9 @@
 struct _Connection
 {
   ngtcp2_conn *conn;
-  int socket_fd;
-  int timer_fd;
+  uv_loop_t *loop;
+  uv_timer_t timer;
+  uv_udp_t *udp_socket;
   struct sockaddr_storage local_addr;
   size_t local_addrlen;
   struct sockaddr_storage remote_addr;
@@ -23,9 +23,19 @@ struct _Connection
   bool is_closed;
 };
 
+void timer_cb(uv_timer_t *handle) {
+  Connection *connection = handle->data;
+  ngtcp2_conn *conn = connection_get_ngtcp2_conn (connection);
+  int ret = ngtcp2_conn_handle_expiry (conn, timestamp ());
+  if (ret < 0)
+    {
+      g_debug ("ngtcp2_conn_handle_expiry: %s", ngtcp2_strerror (ret));
+    }
+  (void)connection_write (connection);
+}
+
 Connection *
-connection_new (void* session,
-                int socket_fd)
+connection_new (uv_loop_t *loop, void* session, uv_udp_t *udp_socket)
 {
   __attribute__((cleanup(connection_freep)))
     Connection *connection = NULL;
@@ -34,8 +44,11 @@ connection_new (void* session,
   if (!connection)
     return NULL;
 
-  connection->socket_fd = socket_fd;
-  connection->timer_fd = -1;
+  connection->udp_socket = udp_socket;
+
+  uv_timer_init(loop, &connection->timer);
+  connection->timer.data = connection;
+  printf("connection new\n");
 
   return g_steal_pointer (&connection);
 }
@@ -48,10 +61,7 @@ connection_free (Connection *connection)
 
   if (connection->conn)
     ngtcp2_conn_del (connection->conn);
-  if (connection->socket_fd >= 0)
-    close (connection->socket_fd);
-  if (connection->timer_fd >= 0)
-    close (connection->timer_fd);
+  uv_timer_stop(&connection->timer);
   g_list_free_full (connection->streams, (GDestroyNotify)stream_free);
   g_free (connection);
 }
@@ -86,24 +96,6 @@ connection_set_ngtcp2_conn (Connection *connection, ngtcp2_conn *conn)
   connection->conn = conn;
 }
 
-int
-connection_get_socket_fd (Connection *connection)
-{
-  return connection->socket_fd;
-}
-
-void
-connection_set_socket_fd (Connection *connection, int socket_fd)
-{
-  connection->socket_fd = socket_fd;
-}
-
-int
-connection_get_timer_fd (Connection *connection)
-{
-  return connection->timer_fd;
-}
-
 struct sockaddr *
 connection_get_local_addr (Connection *connection, size_t *local_addrlen)
 {
@@ -134,54 +126,32 @@ connection_start (Connection *connection)
 {
   g_return_val_if_fail (connection->conn, -1);
 
-  connection->timer_fd = timerfd_create (CLOCK_MONOTONIC, TFD_NONBLOCK);
-  if (connection->timer_fd < 0)
-    {
-      g_message ("timerfd_create: %s", g_strerror (errno));
-      return -1;
-    }
-
+  uv_timer_start(&connection->timer, timer_cb, 0, 0);
   return 0;
 }
 
-int
-connection_read (Connection *connection)
-{
-  uint8_t buf[BUF_SIZE];
-  ngtcp2_ssize ret;
+void udp_send_cb(uv_udp_send_t *req, int status) {
+  if (status) {
+      fprintf(stderr, "Send error: %s\n", uv_strerror(status));
+  }
+  free(req->data);
+  free(req);
+}
 
-  for (;;)
-    {
-      struct sockaddr_storage remote_addr;
-      size_t remote_addrlen = sizeof(remote_addr);
-      ret = recv_packet (connection->socket_fd, buf, sizeof(buf),
-                         (struct sockaddr *)&remote_addr, &remote_addrlen);
-      if (ret < 0)
-        {
-          if (errno == EAGAIN || errno == EWOULDBLOCK)
-            break;
-          g_message ("recv_packet: %s", g_strerror (errno));
-          return -1;
-        }
-
-      ngtcp2_path path;
-      memcpy (&path, ngtcp2_conn_get_path (connection->conn), sizeof(path));
-      path.remote.addrlen = remote_addrlen;
-      path.remote.addr = (struct sockaddr *)&remote_addr;
-
-      ngtcp2_pkt_info pi;
-      memset (&pi, 0, sizeof(pi));
-
-      ret = ngtcp2_conn_read_pkt (connection->conn, &path, &pi, buf, ret,
-                                  timestamp ());
-      if (ret < 0)
-	{
-          g_message ("ngtcp2_conn_read_pkt: %s", ngtcp2_strerror (ret));
-	  return -1;
-	}
-    }
-
-  return 0;
+void send_udp_message(uv_udp_t *send_socket, const uint8_t *data, size_t data_size,
+  const struct sockaddr *remote_addr) {
+  g_message("send_udp_message %lu", data_size);
+  uv_udp_send_t *send_req = malloc(sizeof(uv_udp_send_t));
+  void *buf = malloc(data_size);
+  memcpy(buf, data, data_size);
+  uv_buf_t buffer = uv_buf_init((char *)buf, data_size);
+  send_req->data = buf;
+  int r = uv_udp_send(send_req, send_socket, &buffer, 1, remote_addr, udp_send_cb);
+  if (r) {
+      fprintf(stderr, "uv_udp_send error: %s\n", uv_strerror(r));
+      free(buf);
+      free(send_req);
+  }
 }
 
 static int
@@ -248,18 +218,7 @@ write_to_stream (Connection *connection, Stream *stream)
       if (stream && n_read > 0)
         stream_mark_sent (stream, n_read);
 
-      int ret;
-
-      ret = send_packet (connection->socket_fd, buf, n_written,
-                         (struct sockaddr *)&connection->remote_addr,
-                         connection->remote_addrlen);
-      if (ret < 0)
-        {
-          if (errno == EAGAIN || errno == EWOULDBLOCK)
-            break;
-          g_message ("send_packet: %s", strerror (errno));
-          return -1;
-        }
+      send_udp_message(connection->udp_socket, buf, n_written, (const struct sockaddr *)&connection->remote_addr);
 
       /* No stream data to be sent */
       if (stream && datav.len == 0)
@@ -290,31 +249,8 @@ connection_write (Connection *connection)
 
   ngtcp2_tstamp expiry = ngtcp2_conn_get_expiry (connection->conn);
   ngtcp2_tstamp now = timestamp ();
-  struct itimerspec it;
-  memset (&it, 0, sizeof (it));
-
-  ret = timerfd_settime (connection->timer_fd, 0, &it, NULL);
-  if (ret < 0)
-    {
-      g_message ("timerfd_settime: %s", g_strerror (errno));
-      return -1;
-    }
-  if (expiry <= now)
-    {
-      it.it_value.tv_sec = 0;
-      it.it_value.tv_nsec = 1;
-    }
-  else
-    {
-      it.it_value.tv_sec = (expiry - now) / NGTCP2_SECONDS;
-      it.it_value.tv_nsec = ((expiry - now) % NGTCP2_SECONDS) / NGTCP2_NANOSECONDS;
-    }
-  ret = timerfd_settime (connection->timer_fd, 0, &it, NULL);
-  if (ret < 0)
-    {
-      g_message ("timerfd_settime: %s", g_strerror (errno));
-      return -1;
-    }
+  uint64_t t = (expiry <= now) ? 0 : (expiry - now) / NGTCP2_MILLISECONDS;
+  uv_timer_start(&connection->timer, timer_cb, t, 0);
 
   return 0;
 }
@@ -341,13 +277,7 @@ connection_close (Connection *connection)
                ngtcp2_strerror ((int)n_written));
   else
     {
-      ssize_t ret;
-
-      ret = send_packet (connection->socket_fd, buf, (size_t)n_written,
-                         (struct sockaddr *)&connection->remote_addr,
-                         connection->remote_addrlen);
-      if (ret < 0)
-        g_message ("send_packet: %s", g_strerror (errno));
+      send_udp_message(connection->udp_socket, buf, n_written, (const struct sockaddr *)&connection->remote_addr);
     }
 
   connection->is_closed = true;

@@ -13,8 +13,6 @@
 #include <ngtcp2/ngtcp2.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -23,6 +21,8 @@
 
 typedef struct _Client
 {
+  uv_loop_t* loop;
+  uv_udp_t udp_recv_socket;
   Connection *connection;
   Stream *streams[MAX_STREAMS]; /* owned by connection */
   size_t n_streams;             /* how many streams we open */
@@ -58,7 +58,7 @@ rand_cb (uint8_t *dest, size_t destlen,
 {
     size_t i;
     for (i = 0; i < destlen; ++i) {
-        *dest = (uint8_t) random();
+        *dest = (uint8_t) rand();
     }
 }
 
@@ -127,216 +127,6 @@ static const ngtcp2_callbacks callbacks =
     .get_new_connection_id = get_new_connection_id_cb,
   };
 
-static int
-handle_stdin (Client *client)
-{
-  uint8_t buf[BUF_SIZE];
-  size_t n_read = 0;
-  int ret;
-
-  while (n_read < sizeof(buf))
-    {
-      ret = read (STDIN_FILENO, buf + n_read, sizeof(buf) - n_read);
-      if (ret == 0)
-        {
-          connection_close (client->connection);
-          return 0;
-        }
-      else if (ret < 0)
-        {
-          if (errno == EAGAIN || errno == EWOULDBLOCK)
-            break;
-          g_message ("read: %s", g_strerror (errno));
-          return -1;
-        }
-      else
-        n_read += ret;
-    }
-  if (n_read == sizeof(buf))
-    {
-      g_message ("read buffer overflow");
-      return -1;
-    }
-
-  if (!client->streams[client->stream_index])
-    {
-      ngtcp2_conn *conn = connection_get_ngtcp2_conn (client->connection);
-      if (!ngtcp2_conn_get_streams_bidi_left (conn))
-        {
-          g_info ("no available bidi streams; skipping");
-          return 0;
-        }
-
-      int64_t stream_id;
-
-      ret = ngtcp2_conn_open_bidi_stream (conn, &stream_id, NULL);
-      if (ret < 0)
-        {
-          g_message ("ngtcp2_conn_open_bidi_stream: %s",
-                     ngtcp2_strerror (ret));
-          return -1;
-        }
-
-      __attribute__((cleanup(stream_freep))) Stream *stream = NULL;
-
-      stream = stream_new (stream_id);
-      if (!stream)
-        return -1;
-
-      client->streams[client->stream_index] =
-        g_steal_pointer (&stream);
-      connection_add_stream (client->connection,
-                             client->streams[client->stream_index]);
-
-      g_debug ("opened stream #%zd", stream_id);
-    }
-
-  if (client->streams[client->stream_index])
-    {
-      ret = stream_push_data (client->streams[client->stream_index],
-                              buf, n_read);
-      if (ret < 0)
-        return -1;
-
-      g_debug ("buffered %zd bytes", n_read);
-
-      if (++client->coalesce_count < client->n_coalescing)
-        return 0;
-    }
-
-  ret = connection_write (client->connection);
-  if (ret < 0)
-    return -1;
-
-  client->stream_index++;
-  client->stream_index %= client->n_streams;
-  client->coalesce_count = 0;
-
-  return 0;
-}
-
-#define MAX_EVENTS 64
-
-static int
-run (Client *client)
-{
-  __attribute__((cleanup(closep))) int epoll_fd = -1;
-
-  epoll_fd = epoll_create1 (0);
-  if (epoll_fd < 0)
-    {
-      g_message ("epoll_create1: %s", g_strerror (errno));
-      return -1;
-    }
-
-  int flags;
-
-  flags = fcntl (STDIN_FILENO, F_GETFL, 0);
-  if (flags < 0)
-    {
-      g_message ("fcntl: %s", g_strerror (errno));
-      return -1;
-    }
-  flags = fcntl (STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-  if (flags < 0)
-    {
-      g_message ("fcntl: %s", g_strerror (errno));
-      return -1;
-    }
-
-  struct epoll_event ev;
-
-  ev.events = EPOLLIN | EPOLLET;
-  ev.data.fd = STDIN_FILENO;
-  if (epoll_ctl (epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev) < 0)
-    {
-      g_message ("epoll_ctl: %s", g_strerror (errno));
-      return -1;
-    }
-
-  ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-  ev.data.fd = connection_get_socket_fd (client->connection);
-  if (epoll_ctl (epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev) < 0)
-    {
-      g_message ("epoll_ctl: %s", g_strerror (errno));
-      return -1;
-    }
-
-  ev.events = EPOLLIN | EPOLLET;
-  ev.data.fd = connection_get_timer_fd (client->connection);
-  if (epoll_ctl (epoll_fd, EPOLL_CTL_ADD, ev.data.fd, &ev) < 0)
-    {
-      g_message ("epoll_ctl: %s", g_strerror (errno));
-      return -1;
-    }
-
-  for (;;)
-    {
-      struct epoll_event events[MAX_EVENTS];
-      int nfds;
-
-      nfds = epoll_wait (epoll_fd, events, MAX_EVENTS, -1);
-      if (nfds < 0)
-        {
-          g_message ("epoll_wait: %s", g_strerror (errno));
-          return -1;
-        }
-
-      for (int n = 0; n < nfds; n++)
-        {
-	  int ret;
-
-          if (events[n].data.fd == connection_get_socket_fd (client->connection))
-            {
-              if (events[n].events & EPOLLIN)
-                {
-                  ret = connection_read (client->connection);
-                  if (ret < 0)
-                    return -1;
-                }
-              if (events[n].events & EPOLLOUT)
-                {
-                  ret = connection_write (client->connection);
-                  if (ret < 0)
-                    return -1;
-                }
-            }
-
-          if (events[n].data.fd == connection_get_timer_fd (client->connection))
-            {
-              ngtcp2_conn *conn =
-                connection_get_ngtcp2_conn (client->connection);
-
-              ret = ngtcp2_conn_handle_expiry (conn, timestamp ());
-              if (ret < 0)
-                {
-                  g_message ("ngtcp2_conn_handle_expiry: %s",
-                             ngtcp2_strerror ((int)ret));
-                  return -1;
-                }
-
-              ret = connection_write (client->connection);
-              if (ret < 0)
-                return -1;
-            }
-
-          if (events[n].data.fd == STDIN_FILENO)
-            {
-              ret = handle_stdin (client);
-              if (ret < 0)
-                return -1;
-              if (connection_is_closed (client->connection))
-                {
-                  close (epoll_fd);
-                  return 0;
-                }
-            }
-        }
-    }
-
-  return 0;
-}
-
 static gint n_streams = 1;
 static gint n_coalescing = 1;
 
@@ -349,6 +139,103 @@ static GOptionEntry entries[] =
     { NULL }
   };
 
+void udp_recv_cb(uv_udp_t *req,
+                 ssize_t nread,
+                 const uv_buf_t *buf,
+                 const struct sockaddr *addr,
+                 unsigned flags) {
+  if (nread < 0) {
+    fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
+    uv_close((uv_handle_t *)req, NULL);
+    free(buf->base);
+    return;
+  }
+  if (nread > 0) {
+    Client *client = req->data;
+    Connection *connection = client->connection;
+    size_t remote_addrlen = (addr->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+
+    ngtcp2_path path;
+    ngtcp2_conn *conn = connection_get_ngtcp2_conn(connection);
+    memcpy(&path, ngtcp2_conn_get_path(conn), sizeof(path));
+    path.remote.addrlen = remote_addrlen;
+    path.remote.addr = (struct sockaddr *)addr;
+
+    ngtcp2_pkt_info pi;
+    memset(&pi, 0, sizeof(pi));
+
+    int ret = ngtcp2_conn_read_pkt(conn, &path, &pi, (const uint8_t *)buf->base, nread,
+                               timestamp());
+    if (ret < 0) {
+      g_message("ngtcp2_conn_read_pkt: %s", ngtcp2_strerror(ret));
+      goto out;
+    }
+    connection_start(connection);
+  }
+out:
+  free(buf->base);
+}
+
+void on_tty_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+    if (nread > 0) {
+        Client *client = stream->data;
+        int ret = 0;
+
+        if (!client->streams[client->stream_index]) {
+          ngtcp2_conn *conn = connection_get_ngtcp2_conn(client->connection);
+          if (!ngtcp2_conn_get_streams_bidi_left(conn)) {
+            g_info("no available bidi streams; skipping");
+            goto out;
+          }
+
+          int64_t stream_id;
+
+          ret = ngtcp2_conn_open_bidi_stream(conn, &stream_id, NULL);
+          if (ret < 0) {
+            g_message("ngtcp2_conn_open_bidi_stream: %s", ngtcp2_strerror(ret));
+            goto out;
+          }
+
+          __attribute__((cleanup(stream_freep))) Stream *stream = NULL;
+
+          stream = stream_new(stream_id);
+          if (!stream)
+            goto out;
+
+          client->streams[client->stream_index] = g_steal_pointer(&stream);
+          connection_add_stream(client->connection,
+                                client->streams[client->stream_index]);
+
+          g_debug("opened stream #%zd", stream_id);
+        }
+
+        if (client->streams[client->stream_index]) {
+          ret = stream_push_data(client->streams[client->stream_index], (const uint8_t *)buf->base,
+                                 nread);
+          if (ret < 0)
+            goto out;
+
+          g_debug("buffered %zd bytes", nread);
+
+          if (++client->coalesce_count < client->n_coalescing)
+            goto out;
+        }
+
+        ret = connection_write(client->connection);
+        if (ret < 0)
+          goto out;
+
+        client->stream_index++;
+        client->stream_index %= client->n_streams;
+        client->coalesce_count = 0;
+    } else {
+        uv_read_stop(stream);
+    }
+out:
+    free(buf->base);
+}
+
+
 int
 main (int argc, char **argv)
 {
@@ -360,6 +247,7 @@ main (int argc, char **argv)
       .stream_index = 0,
       .n_coalescing = 0,
       .coalesce_count = 0,
+      .loop = uv_default_loop(),
     };
   int ret;
 
@@ -388,16 +276,17 @@ main (int argc, char **argv)
   struct sockaddr_storage local_addr, remote_addr;
   size_t local_addrlen = sizeof(local_addr), remote_addrlen;
 
-  __attribute__((cleanup(closep))) int fd = -1;
-
-  fd = resolve_and_connect (argv[1], argv[2],
-                            (struct sockaddr *)&local_addr,
-                            &local_addrlen,
-                            (struct sockaddr *)&remote_addr,
-                            &remote_addrlen);
-  if (fd < 0)
-    error (EXIT_FAILURE, errno, "resolve_and_connect failed\n");
-
+  if (!resolve_and_connect (client.loop, argv[1], argv[2],
+    &client.udp_recv_socket, udp_recv_cb,
+    (struct sockaddr *)&local_addr,
+    &local_addrlen,
+    (struct sockaddr *)&remote_addr,
+    &remote_addrlen)) {
+    g_error ("resolve_and_connect failed\n");
+    return -errno;
+  }
+  
+  client.udp_recv_socket.data = &client;
 
   /* Create an ngtcp2 client connection */
   ngtcp2_path path =
@@ -428,14 +317,18 @@ main (int argc, char **argv)
   params.initial_max_data = 1024 * 1024;
 
   ngtcp2_cid scid, dcid;
-  if (get_random_cid (&scid) < 0 || get_random_cid (&dcid) < 0)
-    error (EXIT_FAILURE, EINVAL, "get_random_cid failed\n");
+  if (get_random_cid (&scid) < 0 || get_random_cid (&dcid) < 0) {
+    g_error ("get_random_cid failed\n");
+    return -EINVAL;
+  }
 
   __attribute__((cleanup(connection_freep))) Connection *connection = NULL;
 
-  connection = connection_new (NULL, steal_fd (&fd));
-  if (!connection)
-    error (EXIT_FAILURE, EINVAL, "connection_new failed\n");
+  connection = connection_new (client.loop, NULL, &client.udp_recv_socket);
+  if (!connection) {
+    g_error ("connection_new failed\n");
+    return -EINVAL;
+  }
 
   __attribute__((cleanup(ngtcp2_conn_delp))) ngtcp2_conn *conn = NULL;
 
@@ -443,9 +336,11 @@ main (int argc, char **argv)
                                 NGTCP2_PROTO_VER_V1,
                                 &callbacks, &settings, &params, NULL,
                                 connection);
-  if (ret < 0)
-    error (EXIT_FAILURE, EINVAL, "ngtcp2_conn_client_new: %s\n",
+  if (ret < 0){
+    g_error ("ngtcp2_conn_client_new: %s\n",
            ngtcp2_strerror (ret));
+    return -EINVAL;
+  }
 
   ngtcp2_conn_set_keep_alive_timeout(conn, NGTCP2_SECONDS * 30);
 
@@ -456,13 +351,21 @@ main (int argc, char **argv)
                              (struct sockaddr *)&remote_addr, remote_addrlen);
 
   ret = connection_start (connection);
-  if (ret < 0)
-    error (EXIT_FAILURE, EINVAL, "connection_start failed\n");
+  if (ret < 0) {
+    g_error("connection_start failed\n");
+    return -EINVAL;
+  }
 
   client.connection = g_steal_pointer (&connection);
   client.n_streams = n_streams;
   client.n_coalescing = n_coalescing;
   client.coalesce_count = 0;
 
-  return run (&client) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+  uv_tty_t tty;
+  uv_tty_init(client.loop, &tty, STDIN_FILENO, 1);
+  tty.data = &client;
+  uv_read_start((uv_stream_t*)&tty, alloc_buffer, on_tty_read);
+
+  uv_run(client.loop, UV_RUN_DEFAULT);
+  return uv_loop_close(client.loop);
 }

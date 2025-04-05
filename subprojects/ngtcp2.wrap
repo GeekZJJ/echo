@@ -1,0 +1,9 @@
+[wrap-file]
+directory = ngtcp2-1.11.0
+source_url = https://github.com/ngtcp2/ngtcp2/releases/download/v1.11.0/ngtcp2-1.11.0.tar.gz
+source_filename = ngtcp2-1.11.0.tar.gz
+source_hash = 41fc390d07b89e2285e1107279518e755cdd5cd046630da3301a9cadcfc9e4b6
+method = cmake
+
+[provide]
+dependency_names = ngtcp2

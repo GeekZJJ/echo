@@ -5,11 +5,12 @@
 
 #include "stream.h"
 #include <ngtcp2/ngtcp2.h>
+#include <uv.h>
 #include <stdbool.h>
 
 typedef struct _Connection Connection;
 
-Connection *connection_new (void* session, int socket_fd);
+Connection *connection_new (uv_loop_t *loop, void* session, uv_udp_t *udp_socket);
 void connection_free (Connection *connection);
 
 ngtcp2_conn *connection_get_ngtcp2_conn (Connection *connection);

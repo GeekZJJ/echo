@@ -1,0 +1,9 @@
+[wrap-file]
+directory = libuv-1.43.0
+source_url = https://codeload.github.com/libuv/libuv/tar.gz/refs/tags/v1.43.0
+source_filename = libuv-1.43.0.tar.gz
+source_hash = 9e27825a55279de69a7c43e42d509fd1337c9bece2547c761e91a1592e91cc4d
+method = cmake
+
+[provide]
+dependency_names = libuv

@@ -5,16 +5,25 @@
 
 #include <ngtcp2/ngtcp2.h>
 #include <stdint.h>
-#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <uv.h>
+#include <stdbool.h>
 
-int resolve_and_connect (const char *host, const char *port,
-                         struct sockaddr *local_addr, size_t *local_addrlen,
-                         struct sockaddr *remote_addr, size_t *remote_addrlen);
+void sockaddr_to_string(struct sockaddr_in *addr, char *str, size_t len);
 
-int resolve_and_bind (const char *host, const char *port,
-                      struct sockaddr *local_addr, size_t *local_addrlen);
+void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
+
+bool 
+resolve_and_connect (uv_loop_t *loop, const char *host, const char *port,
+                     uv_udp_t *udp_recv_socket, uv_udp_recv_cb udp_recv_cb,
+                     struct sockaddr *local_addr, size_t *local_addrlen,
+                     struct sockaddr *remote_addr, size_t *remote_addrlen);
+
+bool
+resolve_and_bind (uv_loop_t *loop, const char *host, const char *port,
+                  uv_udp_t *udp_recv_socket, uv_udp_recv_cb udp_recv_cb,
+                  struct sockaddr *local_addr, size_t *local_addrlen);
 
 uint64_t timestamp (void);
 void log_printf (void *user_data, const char *fmt, ...);
